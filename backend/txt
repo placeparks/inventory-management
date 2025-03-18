@@ -1,0 +1,173 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const nodemailer = require('nodemailer');
+const twilio = require('twilio');
+const cron = require('node-cron');
+const bodyParser = require('body-parser');
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 5000;
+
+// Database Connection
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log('MongoDB Connected'))
+    .catch(err => console.log(err));
+
+// Medicine Schema
+const medicineSchema = new mongoose.Schema({
+    name: String,
+    quantity: Number,
+    threshold: Number,
+    history: [
+        {
+            amountTaken: { type: Number, default: 0 },
+            amountRestocked: { type: Number, default: 0 },
+            date: { type: Date, default: Date.now }
+        }
+    ]
+});
+
+
+// **✅ Fix: Define Medicine Model**
+const Medicine = mongoose.model('Medicine', medicineSchema);
+
+// 🚀 Routes
+
+// Fetch all medicines
+app.get('/medicines', async (req, res) => {
+    const medicines = await Medicine.find();
+    res.json(medicines);
+});
+
+// Add medicine
+app.post('/medicines', async (req, res) => {
+    const { name, quantity, threshold } = req.body;
+    const newMedicine = new Medicine({ name, quantity, threshold });
+    await newMedicine.save();
+    res.json(newMedicine);
+});
+
+// Update medicine stock
+app.put('/medicines/:id', async (req, res) => {
+    const { amountTaken, amountRestocked } = req.body;
+    const medicine = await Medicine.findById(req.params.id);
+
+    if (!medicine) {
+        return res.status(404).json({ error: "Medicine not found" });
+    }
+
+    // 🔍 Debug: Log incoming request
+    console.log("📩 Incoming Update Request:", req.body);
+    console.log(`🛑 Before Update - Medicine: ${medicine.name}, Quantity: ${medicine.quantity}`);
+
+    // Deduct stock if amountTaken is provided
+    if (amountTaken) {
+        medicine.quantity -= parseInt(amountTaken);
+        console.log(`📉 Reduced Stock: -${amountTaken}`);
+        medicine.history.push({ 
+            amountTaken: parseInt(amountTaken), 
+            amountRestocked: 0, 
+            date: new Date() 
+        });
+    }
+
+    // Add stock if amountRestocked is provided
+    if (amountRestocked) {
+        medicine.quantity += parseInt(amountRestocked);
+        console.log(`📦 Restocked: +${amountRestocked}`);
+        medicine.history.push({ 
+            amountTaken: 0, 
+            amountRestocked: parseInt(amountRestocked), 
+            date: new Date() 
+        });
+    }
+
+    // 🔍 Debug: Log updated medicine data
+    console.log(`✅ After Update - Medicine: ${medicine.name}, Quantity: ${medicine.quantity}`);
+    console.log("📜 Updated History:", medicine.history);
+
+    await medicine.save();
+
+    // 🚨 Trigger alert if stock goes below threshold
+    if (medicine.quantity < medicine.threshold) {
+        console.log(`⚠️ Alert Triggered for ${medicine.name} - Stock Below Threshold!`);
+        await sendAlert(medicine);
+    }
+
+    res.json(medicine);
+});
+
+// Delete medicine
+app.delete('/medicines/:id', async (req, res) => {
+    await Medicine.findByIdAndDelete(req.params.id);
+    res.json({ message: "Medicine deleted" });
+});
+
+
+const sendAlert = async (medicine) => {
+    const { name, quantity } = medicine;
+
+    try {
+        // 📧 Email Notification
+        const transporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: {
+                user: process.env.EMAIL_USER,
+                pass: process.env.EMAIL_PASS
+            }
+        });
+
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: process.env.ALERT_EMAIL,
+            subject: `Low Stock Alert: ${name}`,
+            text: `The stock for ${name} is low. Only ${quantity} left.`
+        };
+
+        await transporter.sendMail(mailOptions);
+        console.log(`📧 Email sent for ${name}`);
+
+    } catch (error) {
+        console.error(`❌ Email failed for ${name}:`, error);
+    }
+
+    try {
+        // 📱 WhatsApp Notification using CallMeBot
+        const message = `🚨 Low Stock Alert: ${name} - Only ${quantity} left!`;
+        const whatsappUrl = `https://api.callmebot.com/whatsapp.php?phone=${process.env.ALERT_PHONE}&text=${encodeURIComponent(message)}&apikey=${process.env.CALLMEBOT_API_KEY}`;
+
+        const response = await axios.get(whatsappUrl);
+        console.log(`📱 WhatsApp Alert sent: ${response.data}`);
+
+    } catch (error) {
+        console.error(`❌ WhatsApp Alert failed:`, error);
+    }
+};
+
+
+
+// 🚨 Check for Low Stock Medicines
+const checkLowStock = async () => {
+    const lowStockMedicines = await Medicine.find({ quantity: { $lt: mongoose.Types.Decimal128 } });
+    
+    if (lowStockMedicines.length === 0) {
+        console.log("✅ No low stock alerts.");
+        return;
+    }
+
+    for (const med of lowStockMedicines) {
+        await sendAlert(med);
+    }
+};
+
+
+// Run check every hour
+cron.schedule('0 * * * *', checkLowStock);
+
+// Start Server
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
